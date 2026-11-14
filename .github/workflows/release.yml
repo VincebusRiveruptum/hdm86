@@ -1,0 +1,113 @@
+name: Build & Release
+
+# - push to dev/develop  -> build + rolling prerelease "dev-latest"
+# - push of a v* tag     -> build + stable release for that tag
+# - push to main/master  -> build only (zip available as a workflow artifact)
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+      - dev
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-dos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Open Watcom 2.0
+        uses: open-watcom/setup-watcom@v0
+        with:
+          version: "2.0"
+
+      - name: Build DOS target (16-bit, real mode, small model)
+        run: |
+          # setup-watcom points INCLUDE at $WATCOM/lh (Linux headers);
+          # DOS targets need the headers in $WATCOM/h
+          export INCLUDE="$WATCOM/h"
+          mkdir -p bin
+          wcl -bt=dos -ms -0 -fe=bin/hdm86.exe hdm86.c
+
+      - name: Prepare DOS package
+        run: |
+          mkdir -p hdm86
+          cp bin/hdm86.exe hdm86/HDM86.EXE
+          cp external/read.me hdm86/READ.ME
+
+      - name: Create zip archive
+        id: pkg
+        run: |
+          case "${{ github.ref_type }}/${{ github.ref_name }}" in
+            tag/*)                     name="hdm86-${{ github.ref_name }}.zip" ;;
+            branch/dev|branch/develop) name="hdm86-dev.zip" ;;
+            *)                         name="hdm86.zip" ;;
+          esac
+          zip -r "$name" hdm86/
+          echo "zip=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dos-artifact
+          path: ${{ steps.pkg.outputs.zip }}
+
+  create-release:
+    needs: [build-dos]
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref_type == 'tag' ||
+       github.ref_name == 'dev' || github.ref_name == 'develop')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download DOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dos-artifact
+
+      - name: Determine Release Parameters
+        id: release_info
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag_name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "release_name=HDmotion86 ${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag_name=dev-latest" >> "$GITHUB_OUTPUT"
+            echo "release_name=HDmotion86 - Development Build (Testing)" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The action does not move an existing tag, so point dev-latest
+      # at the current commit by hand.
+      - name: Move dev-latest tag
+        if: github.ref_type == 'branch'
+        run: |
+          git tag -f dev-latest
+          git push -f origin refs/tags/dev-latest
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ${{ steps.release_info.outputs.release_name }}
+          prerelease: ${{ steps.release_info.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.release_info.outputs.prerelease != 'true' }}
+          files: hdm86*.zip
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
